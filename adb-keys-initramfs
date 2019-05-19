@@ -1,0 +1,132 @@
+#!/usr/bin/env python3
+
+import argparse
+import hashlib
+import io
+import pathlib
+import shutil
+import struct
+import zipfile
+import zlib
+
+import cpiofile
+
+
+_HEADER_STRUCT = struct.Struct("<8s10I16s512s32s1024s")
+_HASH_FLEN_STRUCT = struct.Struct("<I")
+
+
+def _patch_boot_img(infile, outfile, entry, keys):
+    """
+    Patch the /boot.img file to add the /adb_keys file to the initramfs.
+
+    infile -- the ZipFile to read from
+    outfile -- the ZipFile to write to
+    entry -- the ZipInfo to copy
+    keys -- the keys to add, as a bytes
+    """
+    # Read file from ZIP.
+    info = infile.getinfo("boot.img")
+    boot_img = infile.read(info)
+
+    # Decode header and sanity check.
+    magic, kernel_size, kernel_lma, initramfs_size, initramfs_lma, second_size, second_lma, tags_lma, page_size, header_version, os_version, product_version, cmdline, original_hash, extra_cmdline = _HEADER_STRUCT.unpack_from(boot_img)
+    if magic != B"ANDROID!":
+        raise ValueError("boot.img does not contain proper magic.")
+    if header_version != 0:
+        raise ValueError(f"boot.img header version {header_version} is not supported by this script.")
+
+    # Determine sizes of objects in pages.
+    kernel_pages = (kernel_size + page_size - 1) // page_size
+    initramfs_pages = (initramfs_size + page_size - 1) // page_size
+    second_pages = (second_size + page_size - 1) // page_size
+
+    # Determine byte positions at which items start.
+    kernel_pos = 1 * page_size
+    initramfs_pos = (1 + kernel_pages) * page_size
+    second_pos = (1 + kernel_pages + initramfs_pages) * page_size
+
+    # Extract items.
+    kernel = boot_img[kernel_pos:kernel_pos + kernel_size]
+    initramfs = boot_img[initramfs_pos:initramfs_pos + initramfs_size]
+    second = boot_img[second_pos:second_pos + second_size]
+
+    # Decompress the initramfs.
+    initramfs = zlib.decompress(initramfs, 16 + zlib.MAX_WBITS)
+
+    # It is a CPIO. Modify it.
+    inbio = io.BytesIO(initramfs)
+    outbio = io.BytesIO()
+    with cpiofile.CPIOFile(inbio, "r") as incpio, cpiofile.CPIOFile(outbio, "w") as outcpio:
+        for cpioentry in incpio.infolist():
+            if cpioentry.name != "adb_keys":
+                with incpio.open(cpioentry, "r") as inmember, outcpio.open(cpioentry, "w") as outmember:
+                    shutil.copyfileobj(inmember, outmember)
+        cpioentry = cpiofile.CPIOInfo(0, 0, 0o100644, 0, 0, 1, 0, len(keys), 0, 0, 0, 0, "adb_keys")
+        with outcpio.open(cpioentry, "w") as outmember:
+            outmember.write(keys)
+
+    # Recompress the initramfs.
+    compressor = zlib.compressobj(level=zlib.Z_BEST_COMPRESSION, wbits=16 + zlib.MAX_WBITS)
+    initramfs = compressor.compress(outbio.getvalue())
+    initramfs += compressor.flush(zlib.Z_FINISH)
+
+    # Calculate new hash.
+    h = hashlib.sha1()
+    h.update(kernel)
+    h.update(_HASH_FLEN_STRUCT.pack(len(kernel)))
+    h.update(initramfs)
+    h.update(_HASH_FLEN_STRUCT.pack(len(initramfs)))
+    h.update(second)
+    h.update(_HASH_FLEN_STRUCT.pack(len(second)))
+    h = h.digest()
+    h += B"\x00" * (32 - len(h))
+
+    # Build new output.
+    with outfile.open(info, "w") as fp:
+        fp.write(_HEADER_STRUCT.pack(magic, len(kernel), kernel_lma, len(initramfs), initramfs_lma, len(second), second_lma, tags_lma, page_size, header_version, os_version, product_version, cmdline, h, extra_cmdline))
+        fp.write(B"\x00" * (page_size - _HEADER_STRUCT.size))
+        fp.write(kernel)
+        fp.write(B"\x00" * ((page_size - (len(kernel) % page_size)) % page_size))
+        fp.write(initramfs)
+        fp.write(B"\x00" * ((page_size - (len(initramfs) % page_size)) % page_size))
+        fp.write(second)
+        fp.write(B"\x00" * ((page_size - (len(second) % page_size)) % page_size))
+
+
+def _copy_unmodified(infile, outfile, entry):
+    """
+    Copy a file from infile to outfile without changing it.
+
+    infile -- the ZipFile to read from
+    outfile -- the ZipFile to write to
+    entry -- the ZipInfo to copy
+    """
+    with infile.open(entry, mode="r") as infp, outfile.open(entry, mode="w") as outfp:
+        shutil.copyfileobj(infp, outfp)
+
+
+def run(infile, outfile, keys):
+    """
+    Perform the patching operation.
+
+    infile -- the ZipFile to read from
+    outfile -- the ZipFile to write to
+    keys -- the ADB public keys to authenticate, as a bytes
+    """
+    for entry in infile.infolist():
+        if entry.filename == "boot.img":
+            _patch_boot_img(infile, outfile, entry, keys)
+        else:
+            _copy_unmodified(infile, outfile, entry)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Patch an Android ZIP file to enable ADB during early boot")
+    parser.add_argument("infile", type=lambda x: zipfile.ZipFile(file=x, mode="r"), help="the ZIP file to patch")
+    parser.add_argument("outfile", type=lambda x: zipfile.ZipFile(file=x, mode="w"), help="where to write the patched file")
+    parser.add_argument("--keys", type=argparse.FileType("rb"), default=pathlib.Path.home() / ".android" / "adbkey.pub", help="the file containing the ADB key(s) to authenticate")
+    args = parser.parse_args()
+    if isinstance(args.keys, pathlib.Path):
+        args.keys = args.keys.open("rb")
+    run(args.infile, args.outfile, args.keys.read())
